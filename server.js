@@ -4,6 +4,22 @@ const path = require("path");
 const express = require("express");
 const webpush = require("web-push");
 
+let admin = null;
+let firebaseReady = false;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    admin = require("firebase-admin");
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    firebaseReady = true;
+    console.log("Firebase Admin listo: las notificaciones nativas Android (FCM) están habilitadas.");
+  } else {
+    console.log("FIREBASE_SERVICE_ACCOUNT_JSON no configurado: solo se enviarán notificaciones Web Push (PWA), no las nativas del APK.");
+  }
+} catch (err) {
+  console.error("No se pudo inicializar Firebase Admin:", err.message);
+}
+
 const CONFIG = {
   apiUrl: process.env.API_URL || "https://sensorinsar.ddns.net/api/lecturas",
   threshold: parseFloat(process.env.THRESHOLD || "1"),
@@ -25,6 +41,7 @@ webpush.setVapidDetails(
 /* ---------- persistencia simple en disco (JSON) ---------- */
 const DATA_DIR = path.join(__dirname, "data");
 const SUBS_FILE = path.join(DATA_DIR, "subscriptions.json");
+const FCM_FILE = path.join(DATA_DIR, "fcm-tokens.json");
 const BASELINE_FILE = path.join(DATA_DIR, "baseline.json");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -44,8 +61,10 @@ function saveJSON(file, data) {
   }
 }
 
-// subscriptions: { [endpoint]: { subscription, apiUrl, threshold } }
+// subscriptions: { [endpoint]: { subscription, apiUrl, threshold, vibrate } }  (Web Push, PWA)
 let subscriptions = loadJSON(SUBS_FILE, {});
+// fcmTokens: { [token]: { apiUrl, threshold, channelId } }  (app nativa Android instalada)
+let fcmTokens = loadJSON(FCM_FILE, {});
 // baseline: { [sensorId]: { pitch, roll, id, ts } }
 let baseline = loadJSON(BASELINE_FILE, {});
 
@@ -63,7 +82,13 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, subscriptions: Object.keys(subscriptions).length, uptimeSec: process.uptime() });
+  res.json({
+    ok: true,
+    subscriptions: Object.keys(subscriptions).length,
+    fcmTokens: Object.keys(fcmTokens).length,
+    firebaseReady,
+    uptimeSec: process.uptime(),
+  });
 });
 
 app.get("/vapid-public-key", (req, res) => {
@@ -90,6 +115,32 @@ app.post("/unsubscribe", (req, res) => {
   if (endpoint && subscriptions[endpoint]) {
     delete subscriptions[endpoint];
     saveJSON(SUBS_FILE, subscriptions);
+  }
+  res.json({ ok: true });
+});
+
+app.post("/subscribe-fcm", (req, res) => {
+  const { token, apiUrl, threshold, channelId } = req.body || {};
+  if (!token) return res.status(400).json({ error: "falta 'token'" });
+  if (!firebaseReady) {
+    return res.status(503).json({
+      error: "El backend no tiene configurado FIREBASE_SERVICE_ACCOUNT_JSON, así que no puede enviar notificaciones nativas todavía.",
+    });
+  }
+  fcmTokens[token] = {
+    apiUrl: apiUrl || CONFIG.apiUrl,
+    threshold: typeof threshold === "number" ? threshold : CONFIG.threshold,
+    channelId: channelId || "alarm_tone_1",
+  };
+  saveJSON(FCM_FILE, fcmTokens);
+  res.json({ ok: true });
+});
+
+app.post("/unsubscribe-fcm", (req, res) => {
+  const { token } = req.body || {};
+  if (token && fcmTokens[token]) {
+    delete fcmTokens[token];
+    saveJSON(FCM_FILE, fcmTokens);
   }
   res.json({ ok: true });
 });
@@ -122,7 +173,11 @@ async function fetchReadings(url) {
 async function runCheck() {
   // Un mismo API puede ser compartido por varias suscripciones con distinto umbral;
   // para simplificar, agrupamos por apiUrl (normalmente todas usan el mismo).
-  const apiUrls = new Set([CONFIG.apiUrl, ...Object.values(subscriptions).map((s) => s.apiUrl)]);
+  const apiUrls = new Set([
+    CONFIG.apiUrl,
+    ...Object.values(subscriptions).map((s) => s.apiUrl),
+    ...Object.values(fcmTokens).map((s) => s.apiUrl),
+  ]);
   let totalAlerts = [];
 
   for (const apiUrl of apiUrls) {
@@ -164,7 +219,14 @@ async function runCheck() {
                 if (subInfo.apiUrl !== apiUrl) continue;
                 const threshold = subInfo.threshold || CONFIG.threshold;
                 if (Math.abs(delta) >= threshold) {
-                  totalAlerts.push({ endpoint, sid, metric, prev, next, delta, threshold, ts: r.timestamp });
+                  totalAlerts.push({ kind: "webpush", key: endpoint, sid, metric, prev, next, delta, threshold, ts: r.timestamp });
+                }
+              }
+              for (const [token, tokInfo] of Object.entries(fcmTokens)) {
+                if (tokInfo.apiUrl !== apiUrl) continue;
+                const threshold = tokInfo.threshold || CONFIG.threshold;
+                if (Math.abs(delta) >= threshold) {
+                  totalAlerts.push({ kind: "fcm", key: token, sid, metric, prev, next, delta, threshold, ts: r.timestamp });
                 }
               }
             }
@@ -186,37 +248,71 @@ async function runCheck() {
   return { checkedApis: apiUrls.size, alertsSent: totalAlerts.length, subscriptions: Object.keys(subscriptions).length };
 }
 
+function buildMessage(list) {
+  let title, body;
+  if (list.length === 1) {
+    const a = list[0];
+    title = `⚠️ Pico detectado — Sensor ${a.sid.toUpperCase()}`;
+    body = `${a.metric === "roll" ? "Roll" : "Pitch"} cambió ${a.delta > 0 ? "+" : ""}${a.delta.toFixed(2)}° (umbral ${a.threshold.toFixed(2)}°)`;
+  } else {
+    const sensors = new Set(list.map((a) => a.sid));
+    title = `⚠️ ${list.length} picos detectados`;
+    body = `En ${sensors.size} sensor(es): ${[...sensors].map((s) => s.toUpperCase()).join(", ")}`;
+  }
+  return { title, body };
+}
+
 async function deliverAlerts(alerts) {
-  // Agrupar alertas por endpoint (suscripción) para mandar una sola notificación si hay varias
-  const byEndpoint = {};
-  for (const a of alerts) (byEndpoint[a.endpoint] = byEndpoint[a.endpoint] || []).push(a);
+  // Agrupar alertas por destinatario (una notificación aunque haya varios picos a la vez)
+  const byKey = {};
+  for (const a of alerts) {
+    const groupKey = a.kind + "::" + a.key;
+    (byKey[groupKey] = byKey[groupKey] || { kind: a.kind, key: a.key, list: [] }).list.push(a);
+  }
 
-  for (const [endpoint, list] of Object.entries(byEndpoint)) {
-    const subInfo = subscriptions[endpoint];
-    if (!subInfo) continue;
+  for (const { kind, key, list } of Object.values(byKey)) {
+    const { title, body } = buildMessage(list);
 
-    let title, body;
-    if (list.length === 1) {
-      const a = list[0];
-      title = `⚠️ Pico detectado — Sensor ${a.sid.toUpperCase()}`;
-      body = `${a.metric === "roll" ? "Roll" : "Pitch"} cambió ${a.delta > 0 ? "+" : ""}${a.delta.toFixed(2)}° (umbral ${a.threshold.toFixed(2)}°)`;
-    } else {
-      const sensors = new Set(list.map((a) => a.sid));
-      title = `⚠️ ${list.length} picos detectados`;
-      body = `En ${sensors.size} sensor(es): ${[...sensors].map((s) => s.toUpperCase()).join(", ")}`;
+    if (kind === "webpush") {
+      const subInfo = subscriptions[key];
+      if (!subInfo) continue;
+      try {
+        await webpush.sendNotification(
+          subInfo.subscription,
+          JSON.stringify({ title, body, vibrate: subInfo.vibrate })
+        );
+      } catch (err) {
+        console.error("web push falló para", key, err.statusCode, err.message);
+        if (err.statusCode === 404 || err.statusCode === 410) {
+          delete subscriptions[key];
+          saveJSON(SUBS_FILE, subscriptions);
+        }
+      }
     }
 
-    try {
-      await webpush.sendNotification(
-        subInfo.subscription,
-        JSON.stringify({ title, body, vibrate: subInfo.vibrate })
-      );
-    } catch (err) {
-      console.error("push falló para", endpoint, err.statusCode, err.message);
-      // Suscripción vencida o inválida: limpiarla
-      if (err.statusCode === 404 || err.statusCode === 410) {
-        delete subscriptions[endpoint];
-        saveJSON(SUBS_FILE, subscriptions);
+    if (kind === "fcm") {
+      const tokInfo = fcmTokens[key];
+      if (!tokInfo || !firebaseReady) continue;
+      try {
+        await admin.messaging().send({
+          token: key,
+          notification: { title, body },
+          android: {
+            priority: "high",
+            notification: {
+              channelId: tokInfo.channelId || "alarm_tone_1",
+              priority: "max",
+              defaultVibrateTimings: false,
+            },
+          },
+        });
+      } catch (err) {
+        console.error("FCM push falló para", key, err.code || err.message);
+        // Token inválido o app desinstalada: limpiarlo
+        if (err.code === "messaging/registration-token-not-registered" || err.code === "messaging/invalid-argument") {
+          delete fcmTokens[key];
+          saveJSON(FCM_FILE, fcmTokens);
+        }
       }
     }
   }
